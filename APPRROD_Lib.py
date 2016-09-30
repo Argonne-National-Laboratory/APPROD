@@ -24,8 +24,8 @@ ______________________________________________________________________________
                    
                        Austin Grelle
                        agrelle@anl.gov
-
-                       Argonne National Laboratory
+ 
+                      Argonne National Laboratory
                        Nuclear Engineering Division
                        9700 S. Cass Ave.
                        Argonne, Illinois 60439
@@ -45,9 +45,6 @@ Functions in this File:
     make_server_manager(port, authkey)
     make_client_manager(ip, port, authkey)
     divideList(l,n)
-    loadFileDialog(message = "Please select a file.")
-    openFileDialog(title = 'Please select an input file.', fileTypes = [('Text file', '.txt')])
-    saveFileAsDialog(message = "Please select a file.")
     readConfigFile(fname)
     stoppedFilesCases(directory, o = False, p = False, dirList = None)
     stoppedFilesCheck(directory, o = False, p = False, dirList = None)
@@ -56,15 +53,20 @@ Functions in this File:
     branchRead(branchingName)
     branchJobs(runs,headB,data,master, wait = True)
     checkFiles(directory, jItems = [], dirList = None)
+    removeP(d)
 
 Classes in this File:
 
 """
 
-import os, wx, threading, Queue, multiprocessing, subprocess, time, shutil, decimal, math, sys
-import Tkinter, tkFileDialog
+import os, threading, Queue, multiprocessing, subprocess, time, shutil, decimal, math, sys
+try:
+    import Tkinter, tkFileDialog
+except:
+    pass
 import pickle
 import socket
+import stat
 
 from multiprocessing import Manager
 from multiprocessing.managers import SyncManager
@@ -83,7 +85,6 @@ result_q = multiprocessing.Queue()
 def get_r_q():
     return result_q
 
-import multiprocessing.reduction
 
 def make_server_manager(port, authkey):
     """ Create a manager for the server, listening on the given port.
@@ -96,7 +97,7 @@ def make_server_manager(port, authkey):
 
     JobQueueManager.register('get_job_q', callable=get_j_q)
     JobQueueManager.register('get_result_q', callable=get_r_q)
-    manager = JobQueueManager(address=('', int(port)), authkey=authkey)
+    manager = JobQueueManager(address=('',int(port)), authkey=authkey)
     manager.start()
     print 'Server started at port %s' % port
     return manager
@@ -122,6 +123,9 @@ def make_client_manager(ip, port, authkey):
     return manager
 
 # Functions --------------------------
+def remove_readonly(func, path, excinfo):
+    os.chmod(path, stat.S_IWRITE)
+    func(path)
 
 def divideList(l,n):
     o = [0 for i in range(n)]
@@ -133,39 +137,6 @@ def divideList(l,n):
     p = [l[:o[0]]]
     for i in range(1,len(o)): p.append(l[sum(o[:i]):sum(o[:i])+o[i]])
     return p
-
-def loadFileDialog(message = "Please select a file."):
-    dlg = wx.FileDialog(self,
-                        message = message,
-                        defaultDir = homeDirectory,
-                        defaultFile = "",
-                        wildcard = "Text Files (*.txt)|*.txt",
-                        style = wx.OPEN)
-    dlg.ShowModal()
-    dlg.Destroy()
-
-def openFileDialog(title = 'Please select an input file.', fileTypes = [('Text file', '.txt')]):
-    root = Tkinter.Tk()
-    root.withdraw()
-    options = {}
-    options['filetypes'] = fileTypes
-    options['title'] = title
-    output_file = tkFileDialog.askopenfilename(**options)
-##    if output_file == '':
-##        print "No file selected, exiting..."
-##        raw_input()
-##        sys.exit()
-    return output_file
-
-def saveFileAsDialog(message = "Please select a file."):
-    dlg = wx.FileDialog(self,
-                        message = "Select or Create Save File",
-                        defaultDir = homeDirectory,
-                        defaultFile = "",
-                        wildcard = "Text Files (*.txt)|*.txt",
-                        style = wx.SAVE)
-    dlg.ShowModal()
-    dlg.Destroy()    
 
 def readConfigFile(fname):
     """ A function designed to read the input file '.Config' which
@@ -471,6 +442,10 @@ def readInputFile(fileName):
 
         # Now for each remaining line in the file
         for each in f[1:]:
+
+            # Handle blank lines
+            if each.strip() == '': continue
+            
             # The items in the line are separated by commas
             line = each.split(",")
             
@@ -534,8 +509,11 @@ def readInputFile(fileName):
 def newRun(fname, data):
     
     # Get the new input filename
-    print "\nPlease select a template file (*.i)"
-    templateName = openFileDialog(title = 'Please select a template file.', fileTypes = [('.i file', '.i')])
+    print "\nPlease select a template file (*.i,*.inp)"
+    try:
+        templateName = openFileDialog(title = 'Please select a template file.', fileTypes = [('Other','*'),('Input template file', ('.i','.inp',))])
+    except:
+        templateName = raw_input()
     if templateName == '': print "\nNo file selected. No changes made."
     
     # If the template file was a valid file
@@ -544,21 +522,18 @@ def newRun(fname, data):
         header, inputs = readInputFile(fname)
 
         if header != [] and inputs != []:
-##            additionalRuns.append([templateName.split('\\')[-1].split('/')[-1].strip(".i"),
-##                                   fname.split('\\')[-1].split('/')[-1].strip(".txt")])
             newJobs = []
             for i in range(len(inputs['Task Name'])):
                 newInputs = {}
                 for each in header: newInputs[each] = inputs[each][i]
                 newJobs.append({'Name':templateName.split('\\')[-1].split('/')[-1].strip(".i"),
                                 'type':'new',
-                                'Dir':data['workingDirectory'] + os.sep + inputs['Task Name'][i] + ' ' + inputs['Run#'][i] + os.sep,
+                                'Dir':inputs['Task Name'][i] + ' ' + inputs['Run#'][i] + os.sep,
                                 'Bat':data['batFile'] + ' ' + templateName.split('\\')[-1].split('/')[-1].strip('.i'),
                                 'header': header,
                                 'inputs': newInputs,
                                 'templateName': templateName
                                 })
-            print newJobs
             return newJobs
 
 def branchRead(branchingName):
@@ -614,7 +589,7 @@ def branchJobs(runs,headB,data,master, wait = True):
     
     for ij in range(len(runs[headB[0]])):
         templateR = runs['Template Location'][ij].split('\\')[-1].split('/')[-1].strip('.i')
-        base = data['workingDirectory'] + os.sep + templateR
+        base = templateR
     
 ##        if not os.path.isdir(base): os.mkdir(base)
 
@@ -632,19 +607,27 @@ def branchJobs(runs,headB,data,master, wait = True):
         for i in range(z1,z2+1):
                 
             name = y + ' ' + str(i)
-            
-            files = os.listdir(data['repository'] + os.sep + name)
-            
-            for each in files:
-                if each.endswith('.r'): rFile = each
-                elif each.endswith('.plt'): pltFile = each
-##            try: os.mkdir(base + os.sep + ys + ' ' + str(i))
-##            except WindowsError as e:
-##                print "\nError : " + str(e)
-##                print "\nThe directory already exists. Please delete the directory"
-##                print "if you would like to launch a run with these settings.\n"
-##                stopping = True
-##                break
+            rFile = ''
+            pltFile = ''
+
+            try:
+                files = os.listdir(data['repository'] + os.sep + name)
+                
+                for each in files:
+                    if each.endswith('.r'):
+                        rFile = each
+                    elif each.endswith('.plt'):
+                        pltFile = each
+
+                if rFile == '' or pltFile == '': raise ValueError, "Missing repository data for " + ('.r File, ' if rFile == '' else '') + ('.plt File.' if pltFile == '' else '.')
+            except ValueError as e:
+                print "Continuing to next entry..."
+                continue
+            except:
+                nameAttempt = y.split('/')[-1].split('\\')[-1].split(os.sep)[-1]
+                print "Missing repository for " + name + ", attempting with: " + nameAttempt + ".plt/.r"
+                rFile = nameAttempt + '.r'
+                pltFile = nameAttempt + '.plt'
             
             newJob = {'Name': base + os.sep + ys + ' ' + str(i),
                       'type': 'branch',
@@ -654,9 +637,9 @@ def branchJobs(runs,headB,data,master, wait = True):
                       'Simulation Scenario Name':y,
                       'Sub-name':ys,
                       'i':i,
-                      'rFile':data['repository'] + os.sep + y + ' ' + str(i) + os.sep + rFile,
+                      'rFile': y + ' ' + str(i) + os.sep + rFile,
                       'templateFile':runs['Template Location'][ij],
-                      'pltFile':data['repository'] + os.sep + y + ' ' + str(i) + os.sep + pltFile,
+                      'pltFile': y + ' ' + str(i) + os.sep + pltFile,
                       'batFile':data['workingDirectory'] + os.sep + data['batFile'],
                       'licenseFile':data['workingDirectory'] + os.sep + data['licenseFile'],
                       'convertallFile':data['workingDirectory'] + os.sep + 'Files For Restart' + os.sep + 'convert_all_403ie.exe',
@@ -723,3 +706,58 @@ def checkFiles(directory, jItems = [], dirList = None):
                 else: biggerProblems.append(each)
 
     return stuffToRedo
+
+def removeP(d):
+    l = os.listdir(d)
+    fileTotal = 0
+    yes = False
+
+    for i in range(len(l)):
+        f = l[i]
+        if f.endswith('.out'):
+            fContents = open(d + os.sep + f)
+
+            # Store the last part of the file in 'finalLine'                        
+            try:
+                # Change the file pointer to near the end of the file
+                fContents.seek(-300,os.SEEK_END)
+                # Read from this near point to the end of the file
+                finalLine = fContents.read(abs(-300))
+                fContents.close()
+                
+            # If we get an IOError, then it probably means
+            # we can't seek [endFileCriteria] characters back from
+            # the end, and we can assume the the file has less
+            # than [endFileCriteria] characters and we can read the
+            # entire file into memory.
+            except IOError:
+                fContents.close()
+                fContents = open(d + os.sep + f)
+                finalLine = fContents.read()
+                fContents.close()
+
+            if 'Transient terminated by end of time step cards.' in finalLine:
+                yes = True
+                break
+            elif '.p perhaps file already exists.' in finalLine:
+                return '.p perhaps file already exists.'
+    if yes:
+        for f in l:
+            if f.endswith(".p"):
+                print "We deleted " + d + os.sep + f 
+                fileTotal += os.stat(d + os.sep + f).st_size
+                os.remove(d + os.sep + f)
+    else: print "Nothing to do for " + d
+                                    
+    return fileTotal
+
+def openFileDialog(title = "Please select a file.", fileTypes = [('.txt file', '.txt')]):
+    root = Tkinter.Tk()
+    root.withdraw()
+    options = {}
+    options['initialdir'] = "."
+    options['parent'] = root
+    options['title'] = title
+    options['filetypes'] = fileTypes
+    fname = tkFileDialog.askopenfilename(**options)
+    return fname
