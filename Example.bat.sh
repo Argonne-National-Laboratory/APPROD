@@ -1,0 +1,1 @@
+C:\executable.exe -options > out.txt
