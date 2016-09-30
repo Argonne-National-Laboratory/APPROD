@@ -75,18 +75,27 @@ Classes in this File:
             run()
             join(timeout=None)
             _process(procDict, passover = False)
+            
 """
-import os, wx, threading, Queue, multiprocessing, subprocess, time, shutil, decimal, math, sys
-import Tkinter, tkFileDialog
+
+import os, threading, Queue, multiprocessing, subprocess, shutil, decimal, math, sys
 import pickle
 from APPRROD_Lib import *
+from time import sleep
 
 ##from multiprocessing import managers
 import socket
 
 # Some important locations
 homeDirectory = os.getcwd()
-IP = socket.gethostbyname(socket.gethostname())
+
+try:
+    IP = socket.gethostbyname(socket.gethostname())
+except socket.gaierror:
+    IP = socket.gethostname()
+except:
+    IP = '0.0.0.0'
+    
 PORTNUM = 55444
 AUTHKEY = 'relap'
 
@@ -104,6 +113,7 @@ class serverMasterThread(threading.Thread):
         self.d = d
         self.out = []
         self.distributed = distributed
+        self.semaphore = threading.Semaphore(1)
         
         # If we provided a base directory to operate from,
         # set it, otherwise use C:\APPRROD
@@ -116,9 +126,6 @@ class serverMasterThread(threading.Thread):
         # the variable to the default value if not
         if 'templateFile' in d: self.templateFile = d['templateFile']
         else: self.templateFile = 'ABR-1000-conv10.i'
-        
-        if 'licenseFile' in d: self.licenseFile = d['licenseFile']
-        else: self.licenseFile = 'rellic.bin'
         
         if 'batFile' in d: self.batFile = d['batFile']
         else: self.batFile = 'run_403.bat'
@@ -134,10 +141,15 @@ class serverMasterThread(threading.Thread):
             self.waitTime = 0.1
             self.d['waitTime'] = '0.1'
         
-        if 'repository' in d: self.repository = d['repository']
-        else: self.repository = 'Q:\Runs'
+        if 'repository' in d:
+            if d['repository'] == d['workingDirectory']:
+                self.repository = None
+            else:
+                self.repository = d['repository']
+        else:
+            self.repository = None
 
-        if distributed: assert os.path.isdir(self.repository), "No repository " + self.repository
+##        if distributed: assert os.path.isdir(self.repository), "No repository " + self.repository
 
         # ------ Thread stuff -------
         if distributed:
@@ -161,12 +173,14 @@ class serverMasterThread(threading.Thread):
             self.threadPool = []
             for i in range(N):
                 self.threadPool.append(serverThread(job_q = self.job_q, result_q = self.out_q,
-                                                    d = (self.d if distributed else None)))
+                                                    d = (self.d if distributed else None),
+                                                    semaphore = self.semaphore))
                 self.stoprequest.wait(self.waitTime)
         else:
             self.threadPool = [serverThread(job_q = self.job_q,
                                             result_q = self.out_q,
-                                            d = (self.d if distributed else None)) for i in range(N)]
+                                            d = (self.d if distributed else None),
+                                            semaphore = self.semaphore) for i in range(N)]
 
         # With the worker threads created, start their operation
         for thread in self.threadPool: thread.start()
@@ -297,30 +311,50 @@ class serverMasterThread(threading.Thread):
         os.chdir(self.workingDirectory)
         
         # Load text-based files into local variables, rather than copying:
-        for each in [templateFile, self.licenseFile, self.batFile]:
-            if each == self.licenseFile: f = open(each,'rb')
-            else: f = open(each)
-            files[each] = f.read()
-            f.close()
+        for each in [templateFile, self.batFile]:
+
+            # Try to open the file 100 times before giving up.
+            i = 0
+            j = False
+            while i < 100:
+                
+                try:
+                    # Operation to read in the files
+                    f = open(each)                    
+                    files[each] = f.read()
+                    f.close()
+                    i += 1
+                    
+                    j = True
+                    break
+                
+                except Exception as e:
+                    sleep(0.1)
+                    
+            if not j:
+                print 'Unable to open: ' + str(each)
+                    
 
         # For each entry in the input file
         for i in range(len(inputs[header[0]])):
             
-            # Create a directory in the base's 
+            # Create a directory in the base's (but remove a previons run's progress if one exists)
+            if os.path.isdir(self.workingDirectory + os.sep + inputs['Task Name'][i] + ' ' + inputs['Run#'][i]):
+                shutil.rmtree(self.workingDirectory + os.sep + inputs['Task Name'][i] + ' ' + inputs['Run#'][i])
+
+            self.stoprequest.wait(self.waitTime)
+
             os.mkdir(self.workingDirectory + os.sep + inputs['Task Name'][i] + ' ' + inputs['Run#'][i])
             
             # Copy the files over for the run.
-            for each in [templateFile, self.licenseFile, self.batFile]:
+            for each in [templateFile, self.batFile]:
                 
                 # Draw the elements from the files dictionary for each
                 # file into a local string called 'localFile'
                 localFile = files[each]
                 
                 # Open a new file for writing in the task's directory with the same name
-                if each == self.licenseFile: 
-                    f = open(self.workingDirectory + os.sep + inputs['Task Name'][i] + ' ' + inputs['Run#'][i] + os.sep + each.split('\\')[-1].split('/')[-1],'wb')
-                else:
-                    f = open(self.workingDirectory + os.sep + inputs['Task Name'][i] + ' ' + inputs['Run#'][i] + os.sep + each.split('\\')[-1].split('/')[-1],'w')
+                f = open(self.workingDirectory + os.sep + inputs['Task Name'][i] + ' ' + inputs['Run#'][i] + os.sep + each.split('\\')[-1].split('/')[-1],'w')
 
                 # If we are operating on the input file.
                 if each == templateFile:
@@ -329,9 +363,52 @@ class serverMasterThread(threading.Thread):
                     # the 'Task Name' or 'Run#'
                     for item in header[2:]:
 
+                        print item
+
+                        # Handle fixed input
+                        if '$' in item:
+                            
+                            # Use a temporary file to write the results to
+                            outFile = ''
+
+                            # Name of the var in the file
+                            name = "{" + item.split("$")[1].replace(".","") + "}"
+                            print name
+
+                            # Spacing before and after
+                            spaceL = int(item.split("$")[0])
+                            spaceR = int(item.split("$")[-1])
+                            
+                            # Iterate over each line in the localFile
+                            for line in localFile.split("\n"):
+                                
+                                # If we found our term (minus the '.' character) in
+                                # curly braces
+                                if name in line:
+                                    
+                                    # Extract the value to the right of it
+                                    value0 = line.split(name)[-1].split('}')[0].strip('{').strip()
+                                    value = float(value0)
+                                    # Replace the term and the following value with a multiplied value
+                                    value = value * float(inputs[item][i])
+
+                                    value = "{:.4E}".format(decimal.Decimal(value)).replace("E","e").replace("+","")
+                                    
+                                    line = line.replace("{" + name + "}" + "{" + str(value0) + "}", " "*spaceL + value + " "*spaceR)
+                                    
+                                    # Append the modified line to our temp outFile
+                                    outFile += line + "\n"
+                                    
+                                else:
+                                    # If the term isn't in it, just append the line
+                                    outFile += line + "\n"
+                                    
+                            # Overwrite our localFile with the modified outFile
+                            localFile = outFile
+
                         # The '.' character in a variable name
                         # indicates a multiplication operation
-                        if "." in item:
+                        elif "." in item:
                             
                             # Use a temporary file to write the results to
                             outFile = ''
@@ -424,6 +501,10 @@ class serverMasterThread(threading.Thread):
                 if not self.distributed: self.cleanprocessFunc()
 
                 try:
+                    # Try and keep a connection
+                    i = self.sizeJQue()
+                    j = self.sizeRQue()
+                    
                     # Blocks the thread until there is a result to 'get'
                     out = self.out_q.get(True,0.2)
 
@@ -453,7 +534,7 @@ class serverMasterThread(threading.Thread):
                     # (((TBD)))
                     
                 # The above code will fail with a Queue.Empty error
-                # if nothing is added in 0.05 seconds. If this is
+                # if nothing is added in 0.2 seconds. If this is
                 # the error, just continue to the next loop iteration.
                 #
                 # It is important that we block only for small amounts of
@@ -461,18 +542,24 @@ class serverMasterThread(threading.Thread):
                 # the thread doesn't lock up and prevent it from quitting
                 # when requested, or other operations such as queryRunning, etc.
                 except Queue.Empty:
-                    i = self.sizeJQue()
-                    j = self.sizeRQue()
                     continue
                 except Exception as e:
-                    if 'Errno 10054' in str(e) or 'Errno 10053' in str(e):
+
+                    # Errno 100 signifies the thread disconnected
+                    if 'Errno 100' in str(e):
+                        # Reconnect to the manager
                         self.manager = make_client_manager(ip = self.d['ip'],
                                                            port = self.d['portnum'],
                                                            authkey = self.d['authkey'])
+                        self.stoprequest.wait(self.waitTime*2)
                         self.job_q = self.manager.get_job_q()
                         self.result_q = self.manager.get_result_q()
+                        # Pass the job queue to all threads (Is this necessary?
+                        #    Job threads reconnect on their own..)
                         for thread in self.threadPool: thread.job_q = self.job_q
-                    print str(e) + " occured in master thread."
+
+                    # Print the error that occurred
+                    print str(e) + " occurred in master thread."
 
                 if self.d['mode'] == 'server':
                     try:
@@ -481,10 +568,17 @@ class serverMasterThread(threading.Thread):
                         continue
                     except Exception as e:
                         print str(e) + " occured in master thread."
+                        
+        elif self.d['mode'] == 'client':
+            while not self.stoprequest.isSet():
+                self.stoprequest.wait(self.waitTime)
 
     def cleanprocessFunc(self):
         """ A function to determine when it is time to
-            clean up, and which Task #'s to attempt to run again
+            clean up, and which Task #'s to attempt to run again.
+
+            ((( DEPRECIATED )))
+             - Current distributed implementation should not necessitate a clean function.
         """
         
         # Determine what items are remaining in all areas
@@ -536,10 +630,21 @@ class serverMasterThread(threading.Thread):
     def addJob(self,job):
         """ If we need to add a job from an external function...
         """
-        self.job_q.put(job)
-        self.jItems.append(job['Name'])
-        if job['Name'] not in self.allItems: self.allItems.append(job['Name'])
-        self.finished.clear()
+        try:
+            self.job_q.put(job)
+            self.jItems.append(job['Name'])
+            if job['Name'] not in self.allItems: self.allItems.append(job['Name'])
+            self.finished.clear()
+        except Exception as e:
+            self.stoprequest.wait(0.5)
+            if 'Errno 100' in str(e) or 'Errno 32' in str(e):
+                self.manager = make_client_manager(ip = self.d['ip'],
+                                                   port = self.d['portnum'],
+                                                   authkey = self.d['authkey'])
+                self.stoprequest.wait(self.waitTime*6)
+                self.job_q = self.manager.get_job_q()
+                self.addJob(job)
+            else: print str(e)
 
     def addThread(self,):
         """ If we need to add a thread, create it and add it to our threadPool list
@@ -547,15 +652,17 @@ class serverMasterThread(threading.Thread):
         if self.distributed:
             thread = serverThread(job_q = self.job_q, result_q = self.out_q,
                                   stoprequest = self.stoprequest,
-                                  d = self.d)
+                                  d = self.d,
+                                  semaphore = self.semaphore)
         else: thread = serverThread(job_q = self.job_q, result_q = self.out_q,
-                                    stoprequest = self.stoprequest,)
-        self.threadPool.append(thread)
+                                    stoprequest = self.stoprequest,
+                                    semaphore = self.semaphore)
         thread.start()
+        self.threadPool.append(thread)
 
     def killThread(self,):
         """ If we need to remove a thread, remove it from the
-            threadPool list and tell it to kill itself
+            threadPool list and tell it to join
         """
         thread = self.threadPool.pop()
         thread.join()
@@ -572,8 +679,8 @@ class serverMasterThread(threading.Thread):
         for i in range(N):
             self.addThread()
             j += 1
-            while self.queryRunning() < j:
-                self.waitrequest.wait(self.waitTime)
+##            while self.queryRunning() < j:
+##                self.waitrequest.wait(self.waitTime)
 
     def killThreads(self, N):
         """ A function to kill N threads
@@ -588,7 +695,7 @@ class serverMasterThread(threading.Thread):
         i = 0
         j = 0
         
-        print "\nKilling " + str(N) + " threads..." + " "*(3-len(str(N))+51) + "|"
+        print "\nStopping " + str(N) + " threads..." + " "*(3-len(str(N))+51) + "|"
         print "_________________________________________________________________________V 100%"
         sys.stdout.write("|")
         
@@ -620,7 +727,7 @@ class serverMasterThread(threading.Thread):
         k = divideList(k,l)
         i = 0
         
-        print "\nKilling " + str(l) + " threads..." + " "*(3-l) + "                                                   |"
+        print "\nKilling " + str(l) + " threads..." + " "*(4-l) + "                                                   |"
         print "________________________________________________________________________V 100%"
         sys.stdout.write("|")
         
@@ -663,10 +770,30 @@ class serverMasterThread(threading.Thread):
         """ A custom function to return the number of items
             in the job Queue
         """
-        return self.job_q.qsize()
+        try:
+            return self.job_q.qsize()
+        except Exception as e:
+            self.stoprequest.wait(0.5)
+            if 'Errno 100' in str(e) or 'Errno 32' in str(e):
+                self.manager = make_client_manager(ip = self.d['ip'],
+                                                   port = self.d['portnum'],
+                                                   authkey = self.d['authkey'])
+                self.stoprequest.wait(self.waitTime*6)
+                self.job_q = self.manager.get_job_q()
+                return self.job_q.qsize()
 
     def sizeRQue(self,):
-        return self.result_q.qsize()
+        try:
+            return self.result_q.qsize()
+        except Exception as e:
+            self.stoprequest.wait(0.5)
+            if 'Errno 100' in str(e) or 'Errno 32' in str(e):
+                self.manager = make_client_manager(ip = self.d['ip'],
+                                                   port = self.d['portnum'],
+                                                   authkey = self.d['authkey'])
+                self.stoprequest.wait(self.waitTime*6)
+                self.result_q = self.manager.get_result_q()
+                return self.result_q.qsize()
 
     def sizeOQue(self,):
         """ A custom function to return the number of items
@@ -723,7 +850,7 @@ class serverMasterThread(threading.Thread):
             
             # A newJob will have a bat command and a directory, for now
             newJob = {'Name': inputs['Task Name'][i] + ' ' + inputs['Run#'][i],
-                      'Dir': self.workingDirectory + os.sep + inputs['Task Name'][i] + ' ' + inputs['Run#'][i] + os.sep,
+                      'Dir': inputs['Task Name'][i] + ' ' + inputs['Run#'][i] + os.sep,
                       'Bat': self.batFile + ' ' + templateFile.split('\\')[-1].split('/')[-1].strip('.i'),
                       'header':header,
                       'inputs':[inputs[i]],
@@ -756,21 +883,21 @@ class serverThread(threading.Thread):
 
         Ask the thread to stop by calling its join() method.
     """
-    def __init__(self, job_q, result_q, stoprequest = None, d = None):
+    def __init__(self, job_q, result_q, stoprequest = None, d = None, semaphore = None):
         super(serverThread, self).__init__()
         self.job_q = job_q
         self.result_q = result_q
+        self.semaphore = semaphore
         if stoprequest: self.stoprequest = stoprequest
         else: self.stoprequest = threading.Event()
         self.isrunning = threading.Event()
 
         if d:
             assert os.path.isdir(d['repository']), "Cannot find the repository directory: " + str(d['repository'])
-            self.repository = d['repository']
+            self.repository = (None if d['repository'] == d['workingDirectory'] else d['repository'])
             self.workingDir = d['workingDirectory']
             self.workingDirectory = self.workingDir
             self.waitTime = float(d['waitTime'])
-            self.licenseFile = d['licenseFile']
             self.batFile = d['batFile']
             self.d = d
         else: self.repository = None
@@ -789,29 +916,46 @@ class serverThread(threading.Thread):
             # strip off the directories and get just the filename
             os.chdir(self.workingDirectory)
             
+            baseDir = homeDirectory
+            
             # Load text-based files into local variables, rather than copying:
-            for each in [templateFile, self.licenseFile, self.batFile]:
-                if each == self.licenseFile: f = open(each,'rb')
-                else: f = open(each)
-                files[each] = f.read()
-                f.close()
+            for each in [templateFile, self.batFile]:
+                i = 0
+                j = False
+                while i < 100:
+                    
+                    try:
+                        if each == templateFile:
+                            f = open(each)
+                        elif each == self.batFile:
+                            f = open(baseDir + os.sep + each.split('\\')[-1].split('/')[-1])
+                        else:
+                            f = open(each)
+                        files[each] = f.read()
+                        f.close()
+                        j = True
+                        break
+                        
+                    except:
+                        sleep(0.1)
+                        i += 1
+
+                if not j:
+                    print 'Unable to open: ' + str(each)
+                        
                 
             # Create a directory in the base's
-            print self.workingDirectory + os.sep + inputs['Task Name'] + ' ' + inputs['Run#']
             os.mkdir(self.workingDirectory + os.sep + inputs['Task Name'] + ' ' + inputs['Run#'])
             
             # Copy the files over for the run.
-            for each in [templateFile, self.licenseFile, self.batFile]:
+            for each in [templateFile, self.batFile]:
                 
                 # Draw the elements from the files dictionary for each
                 # file into a local string called 'localFile'
                 localFile = files[each]
                 
                 # Open a new file for writing in the task's directory with the same name
-                if each == self.licenseFile: 
-                    f = open(self.workingDirectory + os.sep + inputs['Task Name'] + ' ' + inputs['Run#'] + os.sep + each.split('\\')[-1].split('/')[-1],'wb')
-                else:
-                    f = open(self.workingDirectory + os.sep + inputs['Task Name'] + ' ' + inputs['Run#'] + os.sep + each.split('\\')[-1].split('/')[-1],'w')
+                f = open(self.workingDirectory + os.sep + inputs['Task Name'] + ' ' + inputs['Run#'] + os.sep + each.split(os.sep)[-1].split('\\')[-1].split('/')[-1],'w')
 
                 # If we are operating on the input file.
                 if each == templateFile:
@@ -820,9 +964,51 @@ class serverThread(threading.Thread):
                     # the 'Task Name' or 'Run#'
                     for item in header[2:]:
 
+                        # Handle fixed input
+                        if '$' in item:
+                            
+                            # Use a temporary file to write the results to
+                            outFile = ''
+
+                            # Name of the var in the file
+                            name = "{" + item.split("$")[1].replace(".","") + "}"
+
+                            # Spacing before and after
+                            spaceL = int(item.split("$")[0])
+                            spaceR = int(item.split("$")[-1])
+                            
+                            # Iterate over each line in the localFile
+                            for line in localFile.split("\n"):
+                                
+                                # If we found our term (minus the '.' character) in
+                                # curly braces
+                                if name in line:
+
+                                    while name in line:
+                                    
+                                        # Extract the value to the right of it
+                                        value0 = line.split(name)[-1].split('}')[0].strip('{').strip()
+                                        value = float(value0)
+                                        # Replace the term and the following value with a multiplied value
+                                        value = value * float(inputs[item])
+
+                                        value = "{:.4E}".format(decimal.Decimal(value)).replace("E","e").replace("+","")
+                                        
+                                        line = line.replace(name + "{" + str(value0) + "}", " "*spaceL + value + " "*spaceR)
+                                    
+                                    # Append the modified line to our temp outFile
+                                    outFile += line + "\n"
+                                    
+                                else:
+                                    # If the term isn't in it, just append the line
+                                    outFile += line + "\n"
+                                    
+                            # Overwrite our localFile with the modified outFile
+                            localFile = outFile
+
                         # The '.' character in a variable name
                         # indicates a multiplication operation
-                        if "." in item:
+                        elif "." in item:
                             
                             # Use a temporary file to write the results to
                             outFile = ''
@@ -872,6 +1058,9 @@ class serverThread(threading.Thread):
 
                 # Close the current file we're operating on
                 f.close()
+                
+                if each == self.batFile and 'linux' in sys.platform:
+                        os.system('chmod +x "' + self.workingDirectory + os.sep + inputs['Task Name'] + ' ' + inputs['Run#'] + os.sep + each.split(os.sep)[-1].split('\\')[-1].split('/')[-1] + '"')
         except Exception as e:
             print "\n" + str(e) + " error in thread.\n"
             os.chdir(self.workingDirectory)
@@ -887,7 +1076,11 @@ class serverThread(threading.Thread):
             stripRST = procDict['stripRST']
             varMap = procDict['varMap']
             i = procDict['i']
-            
+
+            if os.path.isdir(base + os.sep + ys + ' ' + str(i)):
+                shutil.rmtree(base + os.sep + ys + ' ' + str(i))
+
+            self.isrunning.wait(self.waitTime)
 
             try: os.mkdir(base + os.sep + ys + ' ' + str(i))
             except WindowsError as e:
@@ -899,42 +1092,80 @@ class serverThread(threading.Thread):
                 return 1
             
             # Copy files
-            f = open(procDict['rFile'],'rb')
-            f2 = open(base + os.sep + ys + ' ' + str(i) + os.sep + procDict['templateR'] + '.r','wb')
-            f2.write(f.read()); f.close(); f2.close();
-            
-            f = open(procDict['pltFile'],'rb')
-            f2 = open(base + os.sep + ys + ' ' + str(i) + os.sep + procDict['templateR'] + '.plt','wb')
-            f2.write(f.read()); f.close(); f2.close();
-            
-            f = open(procDict['batFile'], 'rb')
-            f2 = open(base + os.sep + ys + ' ' + str(i) + os.sep + data['batFile'],'wb')
-            f2.write(f.read()); f.close(); f2.close();
+            fCheck = 0
+            while fCheck < 100 and not any([each.endswith(procDict['templateR'] + '.r') for each in os.listdir(base + os.sep + ys + ' ' + str(i))]):
 
-            f = open(procDict['licenseFile'], 'rb')
-            f2 = open(base + os.sep + ys + ' ' + str(i) + os.sep + data['licenseFile'],'wb')
-            f2.write(f.read()); f.close(); f2.close();
+                self.isrunning.wait(self.waitTime)
+                fCheck += 1
+                
+                f = open(self.repository + os.sep + procDict['rFile'],'rb')
+                f2 = open(base + os.sep + ys + ' ' + str(i) + os.sep + procDict['templateR'] + '.r','wb')
+                f2.write(f.read()); f.close(); f2.close();
+                
+            fCheck = 0
+            while fCheck < 100 and not any([each.endswith(procDict['templateR'] + '.plt') for each in os.listdir(base + os.sep + ys + ' ' + str(i))]):
+
+                self.isrunning.wait(self.waitTime)
+                fCheck += 1
+            
+                f = open(self.repository + os.sep + procDict['pltFile'],'rb')
+                f2 = open(base + os.sep + ys + ' ' + str(i) + os.sep + procDict['templateR'] + '.plt','wb')
+                f2.write(f.read()); f.close(); f2.close();
+                
+            fCheck = 0
+            while fCheck < 100 and not any([each.endswith(data['batFile'].split(os.sep)[-1].split('\\')[-1].split('/')[-1]) for each in os.listdir(base + os.sep + ys + ' ' + str(i))]):
+
+                self.isrunning.wait(self.waitTime)
+                fCheck += 1
+            
+                f = open(self.batFile, 'rb')
+                f2 = open(base + os.sep + ys + ' ' + str(i) + os.sep + data['batFile'].split(os.sep)[-1].split('\\')[-1].split('/')[-1],'wb')
+                f2.write(f.read()); f.close(); f2.close();
             
             # Template file might need to be modified
             if stripRST and varMap:
                 # If the template file needs to be modified...
                 
                 #Copying convert_all_403ie.exe
-                f = open(data['workingDirectory'] + os.sep + 'Files For Restart' + os.sep + 'convert_all_403ie.exe','rb')
-                f2 = open(base + os.sep + ys + ' ' + str(i) + os.sep + 'convert_all_403ie.exe','wb')
-                f2.write(f.read()); f.close(); f2.close();
-                # Copying Rel3D_403-Xc_DQ.bat
-                f = open(data['workingDirectory'] + os.sep + 'Files For Restart' + os.sep + 'Rel3D_403-Xc_DQ.bat','rb')
-                f2 = open(base + os.sep + ys + ' ' + str(i) + os.sep + 'Rel3D_403-Xc_DQ.bat','wb')
-                f2.write(f.read()); f.close(); f2.close();
+                fCheck = 0
+                while fCheck < 100 and not any([each.endswith('convert_all_403ie.exe') for each in os.listdir(base + os.sep + ys + ' ' + str(i))]):
+
+                    self.isrunning.wait(self.waitTime)
+                    fCheck += 1
+                    f = open(data['workingDirectory'] + os.sep + 'Files For Restart' + os.sep + 'convert_all_403ie.exe','rb')
+                    f2 = open(base + os.sep + ys + ' ' + str(i) + os.sep + 'convert_all_403ie.exe','wb')
+                    f2.write(f.read()); f.close(); f2.close();
+                    
+                fCheck = 0
+                while fCheck < 100 and not any([each.endswith('Rel3D_403-Xc_DQ.bat') for each in os.listdir(base + os.sep + ys + ' ' + str(i))]):
+
+                    self.isrunning.wait(self.waitTime)
+                    fCheck += 1
+                        
+                    # Copying Rel3D_403-Xc_DQ.bat
+                    f = open(data['workingDirectory'] + os.sep + 'Files For Restart' + os.sep + 'Rel3D_403-Xc_DQ.bat','rb')
+                    f2 = open(base + os.sep + ys + ' ' + str(i) + os.sep + 'Rel3D_403-Xc_DQ.bat','wb')
+                    f2.write(f.read()); f.close(); f2.close();
+                    
+                fCheck = 0
+                while fCheck < 100 and not any([each.endswith(stripRST.split('\\')[-1].split('/')[-1]) for each in os.listdir(base + os.sep + ys + ' ' + str(i))]):
+
+                    self.isrunning.wait(self.waitTime)
+                    fCheck += 1
                 
-                f = open(stripRST, 'rb')
-                f2 = open(base + os.sep + ys + ' ' + str(i) + os.sep + stripRST.split('\\')[-1].split('/')[-1],'wb')
-                f2.write(f.read()); f.close(); f2.close();
+                    f = open(stripRST, 'rb')
+                    f2 = open(base + os.sep + ys + ' ' + str(i) + os.sep + stripRST.split('\\')[-1].split('/')[-1],'wb')
+                    f2.write(f.read()); f.close(); f2.close();
+                    
+                fCheck = 0
+                while fCheck < 100 and not any([each.endswith(varMap.split('\\')[-1].split('/')[-1]) for each in os.listdir(base + os.sep + ys + ' ' + str(i))]):
+
+                    self.isrunning.wait(self.waitTime)
+                    fCheck += 1
                 
-                f = open(varMap, 'rb')
-                f2 = open(base + os.sep + ys + ' ' + str(i) + os.sep + varMap.split('\\')[-1].split('/')[-1],'wb')
-                f2.write(f.read()); f.close(); f2.close();
+                    f = open(varMap, 'rb')
+                    f2 = open(base + os.sep + ys + ' ' + str(i) + os.sep + varMap.split('\\')[-1].split('/')[-1],'wb')
+                    f2.write(f.read()); f.close(); f2.close();
 
                 # With all of the necessary files called, invoke the .bat file
                 FNULL = open(os.devnull, 'w')
@@ -991,7 +1222,7 @@ class serverThread(threading.Thread):
                 
             # Template file isn't modified
             else: 
-                f = open(procDict['templateFile'], 'rb')
+                f = open(self.repository + os.sep + procDict['templateFile'], 'rb')
                 f2 = open(base + os.sep + ys + ' ' + str(i) + os.sep + procDict['templateR'] + '.i','wb')                                
                 f2.write(f.read()); f.close(); f2.close();
     
@@ -1032,42 +1263,56 @@ class serverThread(threading.Thread):
             except Queue.Empty:
                 continue
             except Exception as e:
-                print "\n" + str(e) + " error in thread Main Process.\n"
+                print "\n" + str(e) + " error in thread Main Process on line + " + str(sys.exc_info()[2].tb_lineno) + "\n"
+                self.stoprequest.wait(0.5)
+                if 'Errno 100' in str(e) or 'Errno 32' in str(e):
+                    self.manager = make_client_manager(ip = self.d['ip'],
+                                                       port = self.d['portnum'],
+                                                       authkey = self.d['authkey'])
+                    self.stoprequest.wait(self.waitTime*6)
+                    self.job_q = self.manager.get_job_q()
                 os.chdir(self.workingDirectory)
-
-    def join(self, timeout=None):
-        """ When the thread is called to "quit", here is how it will quit.
-        """
-        # Set the stop request, to tell it in other functions that we're done
-        self.stoprequest.set()
         
         # Then, we will need to call the thread class's 'quit' operation
         # as well to handle any other quit things we didn't do in our
         # custom function
         super(serverThread, self).join(timeout)
 
+    def join(self, timeout=None):
+        """ When the thread is called to "quit", here is how it will quit.
+        """
+        # Set the stop request, to tell it in other functions that we're done
+        self.stoprequest.set()
+
     def _process(self, procDict, passover = False):
         """ Given a process dictionary, calls the simulator exe
         """
+        # Wait to begin
+        self.semaphore.acquire()
 
-        if self.repository and not passover:
+        if not passover:
             if procDict['type'] == 'new':
                 self._startNewJob(procDict['header'],procDict['inputs'],procDict['templateName'])
             elif procDict['type'] == 'branch':
                 r = self._branchNewJob(procDict,self.d)
                 if r == 2: return 2
-            self.isrunning.wait(self.waitTime)
         
         # Change directory to the prescribed directory
         while True:
             try:
-                os.chdir(procDict['Dir'])
-                break
-            except:
+                if procDict['type'] == 'new':
+                    print "New run: " + self.workingDir + os.sep + procDict['Dir'].rstrip('\\').rstrip('/')
+                    os.chdir(self.workingDir + os.sep + procDict['Dir'].rstrip('\\').rstrip('/'))
+                    break
+                elif procDict['type'] == 'branch':
+                    print "Branched " + procDict['Dir'].rstrip('\\').rstrip('/')
+                    os.chdir(self.workingDir + os.sep + procDict['Dir'].rstrip('\\').rstrip('/'))
+                    break
+                    
+            except Exception as e:
+                print e
                 self.isrunning.wait(self.waitTime)
                 continue
-
-        self.isrunning.wait(self.waitTime)
 
         # Set the 'isrunning' event to indicate we are processing
         # the request
@@ -1075,25 +1320,84 @@ class serverThread(threading.Thread):
 
         # Open a pipe to dump output to from the batch file operation so it
         # doesn't fill the screen
-        FNULL = open(os.devnull, 'w')
+        if 'win' in sys.platform: 
+            FNULL = open(os.devnull, 'w')
+        else:
+            FNULL = open(os.devnull, 'w')
 
+        # Release the semaphore
+        sleep(self.waitTime)
+        
         # Run the command and record the resulting status of the command
-        status = subprocess.call(procDict['Bat'], stdout=FNULL, stderr=subprocess.STDOUT)
+        if 'win' in sys.platform:         
+            self.semaphore.release()
+            status = os.system(procDict['Bat'] + " > NUL")
+        elif 'linux' in sys.platform:
+            self.semaphore.release()
+            status = os.system('.' + os.sep + self.batFile.split(os.sep)[-1].split('\\')[-1].split('/')[-1] + ' ' + procDict['Bat'].split()[-1])
+        else:
+            self.semaphore.release()
+            status = os.system(procDict['Bat'])
+
+        sleep(self.waitTime)
 
         # We're now finished running at this point, so clear the 'isrunning' event
         self.isrunning.clear()
 
         if self.repository and status not in [47,'47',1,'1',2]:
-            location = self.repository + os.sep + procDict['Dir'].split(self.workingDir)[1].strip(os.sep).strip('\\').strip('/')
-            assert not os.path.isdir(location) , "The directory already exists at the repository location:\n" + location
-            shutil.copytree(procDict['Dir'],location)
-            self.isrunning.wait(self.waitTime)
+
+            try: 
+                # Remove the P file if it is 'Transient terminated by end of time step cards.' in '.out'
+                if procDict['type'] == 'new':                
+                    location = self.repository + os.sep + procDict['Dir'].strip(os.sep).strip('\\').strip('/')
+                    locationUsed = self.workingDir + os.sep + procDict['Dir'].rstrip('\\').rstrip('/')
+                elif procDict['type'] == 'branch':
+                    location = self.repository + os.sep + procDict['Dir'].strip(os.sep).strip('\\').strip('/')
+                    locationUsed = self.workingDir + os.sep + procDict['Dir'].rstrip('\\').rstrip('/')
+                    
+                if os.path.isdir(location):
+                    print "The directory already exists at the repository location:\n" + location
+                    return 144
+
+                # Remove the P file if it is 'Transient terminated by end of time step cards.' in '.out'             
+                #x = removeP(locationUsed)
+
+                # For RELAP case where for some reason we didn't start.
+                # TODO: this shouldn't happen. Need to figure out why it happens.   
+                # Wait to begin
+                self.semaphore.acquire()          
+                if False:#isinstance(x,str):
+                    if '.p perhaps file already exists.' in x:
+                        for f in os.listdir(locationUsed):
+                            os.remove(locationUsed + os.sep + f)
+                        shutil.rmtree(locationUsed, onerror=remove_readonly)
+                        print "p file already existed, trying again for " + procDict['Dir'].strip(os.sep).strip('\\').strip('/')
+                        return self._process(procDict)
+                
+                else:
+                    shutil.copytree(locationUsed,location)
+                    sleep(self.waitTime*2)
+                    while True:
+                        try:
+                            shutil.rmtree(locationUsed, onerror=remove_readonly)
+                            break
+                        except Exception as e:
+                            sleep(self.waitTime)
+                            if 'Error 32' in str(e): continue
+                            else:
+                                print str(e)
+                                break
+                self.semaphore.release()   
+            except Exception as e:
+                print str(e) + " on line + " + str(sys.exc_info()[2].tb_lineno)
+                raise 
+            
         elif status in [47,'47']:
-            self.isrunning.wait(self.waitTime)
-            fList = os.listdir(procDict['Dir'])
+            sleep(self.waitTime)
+            fList = os.listdir(d + os.sep + procDict['Dir'])
             for f in fList:
                 if f.endswith('.out') or f.endswith('.p'):
-                    os.remove(procDict['Dir'] + os.sep + f)
+                    os.remove(d + os.sep + procDict['Dir'] + os.sep + f)
             self._process(procDict,passover=True)
         
         # Return the result: 0 if no problems

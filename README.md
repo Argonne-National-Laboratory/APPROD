@@ -23,7 +23,7 @@ The variables in the header should correspond to values in the template file. Fo
 	*                srch         press          temp         squal
 	1000201           0.0    1.013529e5          {AT}           0.0
 
-...would become, based on the value for Scenario 501 in the sample "input deck" attached:
+...would become, based on the value for Scenario 501 in the sample "input deck" attached (note how it affects the spacing of the following `0.0`):
 
 	*                srch         press          temp         squal
 	1000201           0.0    1.013529e5          247.87           0.0
@@ -46,7 +46,7 @@ Variable names with a period (.) in the header name are used as a multiplier in 
 	20100304        1727.0        16.0166
 	20100305        3000.0        16.0166
 
-Now a new feature...           "4$.VAR$5" with a value X below the input will mean {VAR}{N} becomes "    (N*X)     " where (N*X) is a format we specify, like :.4E, where 1234 would become 1.2340e3 and 1230498102348 would become 1.2305e12.   (We can work out the formatting details later when you return, but this is now possible and is the current setup on C348174.
+Aa new feature... `4$.VAR$5` with a value X below the input will mean `{VAR}{N}` becomes `    (N*X)     ` where (N*X) is a format `:.4E`, where `1234` would become `1.2340e3` and `1230498102348` would become `1.2305e12`.   This is currently hard-coded in that format in `APPROD_Threads.py` but we can propose a change later perhaps.
 
 So the main idea is the integer before the first "$" is the number of spaces before, the integer after the second "$" is the number of spaces after, the period is still required, and the value N is now encased in its own "{}" rather than being white-space delimited.
 
